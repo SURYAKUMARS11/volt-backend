@@ -24,8 +24,7 @@ try:
     print("Supabase admin client initialized successfully.")
 except Exception as e:
     print(f"Error initializing Supabase client: {e}")
-    supabase_admin_auth = None # Set to None if initialization fails
-
+    supabase_admin_auth = None 
 
 @app.route('/api/create-supabase-user', methods=['POST'])
 def create_supabase_user():
