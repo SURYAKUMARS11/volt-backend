@@ -23,7 +23,13 @@ app_logger = logging.getLogger(__name__)
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {
+    "origins": [
+        "http://localhost:4200",
+        "http://10.37.143.101:4200",
+        "https://your-frontend-deploy-url.com"
+    ]
+}})
 
 # --- REQUIRED FOR ADMIN SESSION AUTHENTICATION ---
 # IMPORTANT: Change this to a strong, random value and store it in an environment variable!
