@@ -591,7 +591,71 @@ def get_invite_data(user_id):
         app_logger.error(f"Error fetching invite data for user {user_id}: {e}", exc_info=True)
         return jsonify({'success': False, 'message': 'An unexpected error occurred while fetching invite data.'}), 500
 
-# --- NEW: Claim Referral Bonus (₹10 per sign-up) ---
+@app.route('/api/user/team-data/<user_id>', methods=['GET'])
+def get_team_data(user_id):
+    if not supabase:
+        app_logger.error("Supabase client not initialized in get_team_data.")
+        return jsonify({'error': 'Backend setup issue: Supabase client not initialized'}), 500
+
+    try:
+        # 1. Fetch total referrals (users whose referrer_id is this user's ID)
+        # We'll use this query to get both the count and the member data.
+        referred_users_response = supabase.table('profiles') \
+                                          .select('id, nickname, phone_number') \
+                                          .eq('referrer_id', user_id) \
+                                          .execute()
+        
+        referred_users = referred_users_response.data if referred_users_response.data else []
+        total_referrals = len(referred_users)
+
+        # 2. Fetch total earnings from the user's wallet
+        wallet_data_response = supabase.table('user_wallets') \
+                                       .select('total_referral_earnings') \
+                                       .eq('user_id', user_id) \
+                                       .single() \
+                                       .execute()
+        
+        total_earnings = 0
+        if wallet_data_response.data:
+            total_earnings = wallet_data_response.data.get('total_referral_earnings', 0.0)
+
+        # 3. Process the list of team members
+        team_members_list = []
+        for member in referred_users:
+            member_id = member['id']
+
+            # You need a way to determine the member's status (active/inactive).
+            # One way is to check for completed recharge transactions.
+            # This is a good place to make this determination.
+            recharge_tx_response = supabase.table('transactions') \
+                                           .select('id') \
+                                           .eq('user_id', member_id) \
+                                           .eq('type', 'recharge') \
+                                           .eq('status', 'completed') \
+                                           .limit(1) \
+                                           .execute()
+            
+            is_active = len(recharge_tx_response.data) > 0
+            
+            team_members_list.append({
+                'name': member.get('full_name', 'Unnamed User'),
+                'phone': f"{member.get('phone_number', '********')[:5]}****{member.get('phone_number', '********')[-2:]}",
+                'status': 'active' if is_active else 'inactive'
+            })
+
+        # 4. Construct and return the final response
+        return jsonify({
+            'success': True,
+            'totalReferrals': total_referrals,
+            'totalEarnings': total_earnings,
+            'teamMembers': team_members_list
+        }), 200
+
+    except Exception as e:
+        app_logger.error(f"Error fetching team data for user {user_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': 'An unexpected error occurred while fetching team data.'}), 500
+
+# --- MODIFIED: Claim Referral Bonus (₹10 per sign-up) ---
 @app.route('/api/user/claim-referral-bonus', methods=['POST'])
 def claim_referral_bonus():
     if not supabase:
@@ -606,11 +670,12 @@ def claim_referral_bonus():
 
     try:
         # Fetch current pending bonus and wallet balance
+        # --- MODIFIED: Added 'order_income' to the select statement ---
         wallet_response = supabase.table('user_wallets') \
-                            .select('balance, pending_referral_bonus, total_referral_earnings') \
-                            .eq('user_id', user_id) \
-                            .single() \
-                            .execute()
+                                 .select('balance, pending_referral_bonus, total_referral_earnings, order_income') \
+                                 .eq('user_id', user_id) \
+                                 .single() \
+                                 .execute()
         
         if not wallet_response.data:
             return jsonify({'success': False, 'message': 'User wallet not found.'}), 404
@@ -618,6 +683,7 @@ def claim_referral_bonus():
         current_balance = wallet_response.data['balance']
         pending_bonus = wallet_response.data['pending_referral_bonus']
         total_referral_earnings = wallet_response.data['total_referral_earnings']
+        current_order_income = wallet_response.data['order_income'] # --- NEW: Fetch current order_income ---
 
         if pending_bonus <= 0:
             return jsonify({'success': False, 'message': 'No pending bonus to claim.'}), 400
@@ -626,12 +692,15 @@ def claim_referral_bonus():
         amount_to_claim = pending_bonus
         new_balance = current_balance + amount_to_claim
         new_total_referral_earnings = total_referral_earnings + amount_to_claim
+        new_order_income = current_order_income + amount_to_claim # --- NEW: Calculate new order_income ---
 
-        # Update wallet: add to balance, reset pending, update total earned
+        # Update wallet: add to balance, reset pending, update total earned and order_income
+        # --- MODIFIED: Added 'order_income' to the update dictionary ---
         update_wallet_response = supabase.table('user_wallets').update({
             'balance': new_balance,
             'pending_referral_bonus': 0.0,
-            'total_referral_earnings': new_total_referral_earnings
+            'total_referral_earnings': new_total_referral_earnings,
+            'order_income': new_order_income
         }).eq('user_id', user_id).execute()
 
         if not update_wallet_response.data:
@@ -649,108 +718,19 @@ def claim_referral_bonus():
         supabase.table('transactions').insert(transaction_data).execute() # Log this, but don't block response on it
 
         app_logger.info(f"User {user_id} claimed ₹{amount_to_claim} referral bonus.")
+        # --- MODIFIED: Added 'new_order_income' to the response ---
         return jsonify({
             'success': True,
             'message': f'₹{amount_to_claim} referral bonus claimed successfully!',
             'new_balance': new_balance,
             'new_pending_bonus': 0.0,
-            'new_total_referral_earnings': new_total_referral_earnings
+            'new_total_referral_earnings': new_total_referral_earnings,
+            'new_order_income': new_order_income
         }), 200
 
     except Exception as e:
         app_logger.error(f"Error claiming referral bonus for user {user_id}: {e}", exc_info=True)
         return jsonify({'success': False, 'message': 'An unexpected error occurred while claiming bonus.'}), 500
-
-
-# --- NEW: Claim Quest Reward ---
-@app.route('/api/user/claim-quest-reward', methods=['POST'])
-def claim_quest_reward():
-    if not supabase:
-        app_logger.error("Supabase client not initialized in claim_quest_reward.")
-        return jsonify({'success': False, 'message': 'Backend setup issue: Supabase client not initialized.'}), 500
-    
-    data = request.json
-    user_id = data.get('userId')
-    quest_id = data.get('questId') # ID of the specific quest row in user_quests table
-
-    if not all([user_id, quest_id]):
-        return jsonify({'success': False, 'message': 'User ID and Quest ID are required.'}), 400
-
-    try:
-        # 1. Fetch the quest details
-        quest_response = supabase.table('user_quests') \
-                            .select('reward_amount, is_completed, is_claimed') \
-                            .eq('id', quest_id) \
-                            .eq('user_id', user_id) \
-                            .single() \
-                            .execute()
-        
-        if not quest_response.data:
-            return jsonify({'success': False, 'message': 'Quest not found or does not belong to user.'}), 404
-        
-        quest = quest_response.data
-
-        if not quest['is_completed']:
-            return jsonify({'success': False, 'message': 'Quest not yet completed.'}), 400
-        if quest['is_claimed']:
-            return jsonify({'success': False, 'message': 'Quest reward already claimed.'}), 400
-
-        reward_amount = quest['reward_amount']
-
-        # 2. Update wallet balance
-        wallet_response = supabase.table('user_wallets') \
-                            .select('balance') \
-                            .eq('user_id', user_id) \
-                            .single() \
-                            .execute()
-        
-        if not wallet_response.data:
-            app_logger.error(f"Wallet not found for user {user_id} during quest claim for quest {quest_id}")
-            return jsonify({'success': False, 'message': 'User wallet not found.'}), 404
-
-        current_balance = wallet_response.data['balance']
-        new_balance = current_balance + reward_amount
-
-        update_wallet_response = supabase.table('user_wallets').update({
-            'balance': new_balance
-        }).eq('user_id', user_id).execute()
-
-        if not update_wallet_response.data:
-            app_logger.error(f"Failed to update wallet for claiming quest reward for user {user_id}. Supabase error: {update_wallet_response.error}")
-            return jsonify({'success': False, 'message': 'Failed to update wallet after claiming quest reward.'}), 500
-        
-        # 3. Mark quest as claimed
-        update_quest_response = supabase.table('user_quests').update({
-            'is_claimed': True,
-            'claimed_at': datetime.datetime.now().isoformat()
-        }).eq('id', quest_id).execute()
-
-        if not update_quest_response.data:
-            app_logger.error(f"Failed to mark quest {quest_id} as claimed for user {user_id}. Supabase error: {update_quest_response.error}")
-            # IMPORTANT: If wallet was updated but quest not marked, you have a consistency issue.
-            # You might need to consider rolling back the wallet update or flagging for manual review.
-            return jsonify({'success': False, 'message': 'Failed to record quest claim status.'}), 500
-
-        # 4. Record transaction
-        transaction_data = {
-            'user_id': user_id,
-            'amount': reward_amount,
-            'type': 'bonus_quest_reward',
-            'status': 'completed',
-            'description': f'Claimed quest reward for {quest["quest_target"]} invites'
-        }
-        supabase.table('transactions').insert(transaction_data).execute()
-
-        app_logger.info(f"User {user_id} claimed quest {quest_id} for ₹{reward_amount}.")
-        return jsonify({
-            'success': True,
-            'message': f'Congratulations! You have claimed ₹{reward_amount} reward!',
-            'new_balance': new_balance
-        }), 200
-
-    except Exception as e:
-        app_logger.error(f"Error claiming quest reward for user {user_id}, quest {quest_id}: {e}", exc_info=True)
-        return jsonify({'success': False, 'message': 'An unexpected error occurred while claiming quest reward.'}), 500
 
 # --- NEW: Create Razorpay Order Endpoint ---
 # This endpoint is called by the frontend to get an order_id before opening the Razorpay popup.
@@ -815,9 +795,8 @@ def create_razorpay_order():
 
 
 # --- MODIFIED: Verify Razorpay Payment Endpoint ---
-# This endpoint is called by the frontend AFTER the payment is made.
 @app.route('/api/recharge/verify-razorpay-payment', methods=['POST'])
-def verify_razorpay_payment(): # Renamed the function to avoid conflict if you had verify_razorpay_payment2
+def verify_razorpay_payment():
     if not razorpay_client or not supabase:
         app_logger.error("Clients not initialized in verify_razorpay_payment.")
         return jsonify({'success': False, 'message': 'Backend setup issue: Clients not initialized.'}), 500
@@ -826,115 +805,156 @@ def verify_razorpay_payment(): # Renamed the function to avoid conflict if you h
     razorpay_order_id = data.get('razorpay_order_id')
     razorpay_payment_id = data.get('razorpay_payment_id')
     razorpay_signature = data.get('razorpay_signature')
-    recharge_amount_inr = data.get('amount') # This amount should be in INR, not paisa, for wallet update
+    recharge_amount_inr = data.get('amount')
     user_id = data.get('userId')
 
     if not all([razorpay_order_id, razorpay_payment_id, razorpay_signature, recharge_amount_inr, user_id]):
+        app_logger.error(f"Missing payment details in request: {data}")
         return jsonify({'success': False, 'message': 'Missing payment details.'}), 400
 
     try:
         # Verify the payment signature
-        # This will raise an exception if the signature is invalid
         razorpay_client.utility.verify_payment_signature({
             'razorpay_order_id': razorpay_order_id,
             'razorpay_payment_id': razorpay_payment_id,
             'razorpay_signature': razorpay_signature
         })
         app_logger.info(f"Razorpay signature verified for payment {razorpay_payment_id}")
-
-        # --- Check if this is the user's first recharge before updating wallet ---
-        is_first_recharge = False
-        existing_recharges = supabase.table('transactions') \
-                               .select('id') \
-                               .eq('user_id', user_id) \
-                               .eq('type', 'recharge') \
-                               .eq('status', 'completed') \
-                               .limit(1) \
-                               .execute()
         
-        if not existing_recharges.data or len(existing_recharges.data) == 0:
-            is_first_recharge = True
-            app_logger.info(f"Detected first recharge for user {user_id}.")
-        # --- End of first recharge check ---
+        # --- NEW: BEGIN REFERRAL COMMISSION LOGIC ---
+        try:
+            # 1. Look up the referrer for the user who just recharged
+            referrer_response = supabase.table('profiles') \
+                                        .select('referrer_id') \
+                                        .eq('id', user_id) \
+                                        .single() \
+                                        .execute()
+            
+            referrer_id = referrer_response.data.get('referrer_id') if referrer_response.data else None
 
-        # Fetch current wallet balance
-        wallet_response = supabase.table('user_wallets').select('balance').eq('user_id', user_id).single().execute()
+            if referrer_id:
+                app_logger.info(f"User {user_id} was referred by {referrer_id}. Calculating commission.")
 
-        if wallet_response.data is None:
-            app_logger.warning(f"Wallet not found for user: {user_id}")
-            return jsonify({'success': False, 'message': 'User wallet not found.'}), 404
+                # 2. Calculate the commission (10% of the recharge amount)
+                commission_amount = float(recharge_amount_inr) * 0.10
+                
+                # 3. Use the NEW RPC to update the referrer's wallet
+                # This RPC will now update BOTH total_referral_earnings and order_income
+                commission_rpc_response = supabase.rpc('increment_referral_commission', {
+                    'p_user_id': referrer_id,
+                    'p_amount': commission_amount
+                }).execute()
 
-        current_balance = wallet_response.data['balance']
-        new_balance = current_balance + recharge_amount_inr # Use the INR amount directly for balance
+                if commission_rpc_response.status_code == 204:
+                    app_logger.info(f"Commission of {commission_amount} credited to referrer {referrer_id}'s total earnings AND withdrawable balance (order_income).")
+                    
+                    # 4. Log the commission in the 'commissions' table for an audit trail
+                    commission_log_data = {
+                        'referrer_id': referrer_id,
+                        'referred_user_id': user_id,
+                        'commission_amount': commission_amount,
+                        'investment_amount': float(recharge_amount_inr)
+                    }
+                    supabase.table('commissions').insert(commission_log_data).execute()
+                    app_logger.info(f"Commission log created for referrer {referrer_id} for referral {user_id}.")
+                else:
+                    app_logger.error(f"Failed to credit commission for referrer {referrer_id}. RPC response: {commission_rpc_response.status_code}")
 
-        # Update wallet balance
-        update_response = supabase.table('user_wallets').update(
-            {'balance': new_balance}
-        ).eq('user_id', user_id).execute()
+        except Exception as commission_error:
+            # IMPORTANT: We catch this error separately so a failure to credit commission
+            # doesn't block the user's main transaction from completing successfully.
+            # We log it and move on. You might want to add an alert for admin here.
+            app_logger.error(f"Error processing referral commission for user {user_id}: {commission_error}", exc_info=True)
+            # The rest of the transaction logic proceeds as normal
+        # --- END NEW REFERRAL COMMISSION LOGIC ---
 
-        if update_response.data and len(update_response.data) > 0:
-            app_logger.info(f"Wallet updated for {user_id}. New balance: {new_balance}")
-        else:
-            app_logger.error(f"Failed to update wallet for {user_id}. Supabase error: {update_response.error if hasattr(update_response, 'error') else 'Unknown'}")
-            # If wallet update fails, you might want to log this as a critical error
-            # and potentially refund or flag for manual review.
-            raise Exception("Supabase wallet update failed after successful payment verification.")
+        # The rest of your existing code continues here, but slightly reorganized
+        
+        # --- Your existing logic to update the user's wallet (recharged_amount) ---
+        app_logger.info(f"Calling RPC 'increment_recharged_amount' for user {user_id} with amount {recharge_amount_inr}")
+        try:
+            rpc_response = supabase.rpc('increment_recharged_amount', {
+                'p_user_id': user_id,
+                'p_amount': float(recharge_amount_inr) 
+            }).execute()
+            app_logger.info(f"Wallet 'recharged_amount' updated via RPC for {user_id}. Supabase response was successful.")
+        except Exception as rpc_exec_error:
+            app_logger.error(f"Failed to execute RPC 'increment_recharged_amount' for {user_id}. Error: {rpc_exec_error}", exc_info=True)
+            raise Exception("Supabase RPC 'increment_recharged_amount' failed...") from rpc_exec_error
 
         # Update the pending transaction status to 'completed'
-        # Or create a new one if you didn't create a 'pending' one in create_razorpay_order
         update_transaction_response = supabase.table('transactions') \
             .update({'status': 'completed', 'payment_gateway_id': razorpay_payment_id}) \
             .eq('payment_gateway_id', razorpay_order_id) \
             .execute()
         
-        if update_transaction_response.data and len(update_transaction_response.data) > 0:
-            app_logger.info(f"Transaction status updated to completed for order {razorpay_order_id}")
-        else:
-            app_logger.error(f"Failed to update transaction status for order {razorpay_order_id}. Supabase error: {update_transaction_response.error if hasattr(update_transaction_response, 'error') else 'Unknown'}")
-            # This is also a critical consistency issue.
+        if not update_transaction_response.data:
+            app_logger.error(f"Failed to update transaction status for order {razorpay_order_id}. Supabase error: {update_transaction_response.error}")
 
-        # --- NEW: Logic for 'activated' referral and quest check ---
-        if is_first_recharge:
-            # Get the referrer's ID for this user
-            referred_user_profile_response = supabase.table('profiles') \
-                                             .select('referrer_id') \
-                                             .eq('id', user_id) \
-                                             .single() \
-                                             .execute()
-            
-            referrer_id = None
-            if referred_user_profile_response.data and referred_user_profile_response.data['referrer_id']:
-                referrer_id = referred_user_profile_response.data['referrer_id']
-                app_logger.info(f"User {user_id} made first recharge. Referrer is {referrer_id}.")
+        # Now, fetch the latest balance to return to the frontend
+        latest_wallet_response = supabase.table('user_wallets').select('recharged_amount').eq('user_id', user_id).single().execute()
+        latest_recharged_amount = latest_wallet_response.data['recharged_amount'] if latest_wallet_response.data else 0
+        app_logger.info(f"Confirmed new recharged_amount by separate fetch: {latest_recharged_amount}")
 
-                # Trigger a refresh of the referrer's invite data to update quest progress
-                # This could be more sophisticated (e.g., a Supabase Function trigger)
-                # For now, we'll just log that an activation occurred.
-                # The '/api/user/invite-data' endpoint will recalculate quest completion.
-                app_logger.info(f"First recharge by referred user {user_id}. Referrer {referrer_id}'s quest progress may have updated.")
-
-        # --- End of NEW logic ---
-
-        return jsonify({'success': True, 'message': 'Recharge successful and wallet updated!', 'new_balance': new_balance})
+        return jsonify({'success': True, 'message': 'Recharge successful and wallet updated!', 'new_recharged_amount': latest_recharged_amount})
 
     except razorpay.errors.SignatureVerificationError as e:
-        app_logger.error(f"Razorpay Signature Verification Failed: {e}", exc_info=True)
-        # If verification fails, update the transaction status to 'failed'
-        supabase.table('transactions') \
-            .update({'status': 'failed', 'description': f'Payment verification failed: {e}'}) \
-            .eq('payment_gateway_id', razorpay_order_id) \
-            .execute()
+        app_logger.error(f"Razorpay Signature Verification Failed for order {razorpay_order_id}: {e}", exc_info=True)
+        supabase.table('transactions').update({'status': 'failed', 'description': f'Payment verification failed: {e}'}).eq('payment_gateway_id', razorpay_order_id).execute()
         return jsonify({'success': False, 'message': 'Payment verification failed: Invalid signature.'}), 400
     except Exception as e:
-        app_logger.error(f"Internal Server Error during payment verification: {e}", exc_info=True)
-        # If any other error occurs, update the transaction status to 'failed'
-        supabase.table('transactions') \
-            .update({'status': 'failed', 'description': f'Internal server error during verification: {e}'}) \
-            .eq('payment_gateway_id', razorpay_order_id) \
-            .execute()
+        app_logger.error(f"Internal Server Error during payment verification for order {razorpay_order_id}: {e}", exc_info=True)
+        supabase.table('transactions').update({'status': 'failed', 'description': f'Internal server error: {e}'}).eq('payment_gateway_id', razorpay_order_id).execute()
         return jsonify({'success': False, 'message': f'Payment verification failed due to an unexpected error.'}), 500
+    
 
+# src/app.py
 
+@app.route('/api/user/recharge-records/<uuid:user_id>', methods=['GET'])
+def get_recharge_records(user_id):
+    # WARNING: This endpoint is now public. Anyone can access any user's records
+    # by changing the user_id in the URL. Proceed with caution.
+    
+    # We no longer need to check if g.user['id'] matches user_id
+    
+    try:
+        response = supabase.table('transactions') \
+            .select('amount, status, created_at, payment_gateway_id') \
+            .eq('user_id', user_id) \
+            .eq('type', 'recharge') \
+            .order('created_at', desc=True) \
+            .execute()
+            
+        records = response.data
+        
+        return jsonify({'success': True, 'records': records}), 200
+
+    except Exception as e:
+        app_logger.error(f"Error fetching recharge records for user {user_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': 'An unexpected error occurred.'}), 500
+    
+@app.route('/api/user/withdrawal-records/<uuid:user_id>', methods=['GET'])
+def get_withdrawal_records(user_id):
+    # WARNING: This endpoint is public. For a production app, you must add authentication.
+
+    try:
+        response = supabase.table('transactions') \
+            .select('id, amount, status, created_at, fee, bank_card_id') \
+            .eq('user_id', user_id) \
+            .eq('type', 'withdrawal') \
+            .order('created_at', desc=True) \
+            .execute()
+        
+        # Handle cases where `fee` might not be present by providing a default value of 0
+        records = [{**record, 'fee': record.get('fee', 0)} for record in response.data]
+
+        return jsonify({'success': True, 'records': records}), 200
+        
+    except Exception as e:
+        app_logger.error(f"Error fetching withdrawal records for user {user_id}: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': 'An unexpected error occurred.'}), 500
+
+    
 @app.route('/api/user/add-bank-card', methods=['POST'])
 def add_bank_card():
     try:
@@ -1049,7 +1069,7 @@ def set_trade_password():
 
         return jsonify({'success': False, 'message': f'Failed to set trade password: {error_message}'}), 500
 
-@app.route('/api/user/verify-password', methods=['POST'])
+@app.route('/api/user/verify-trade-password', methods=['POST'])
 def verify_user_password():
     try:
         data = request.json
@@ -1106,72 +1126,75 @@ def handle_withdrawal_request():
         user_id = data.get('userId')
         amount = data.get('amount') # Amount in INR
         bank_card_id = data.get('bankCardId')
-        bank_details = data.get('bankDetails') # Contains account_number, ifsc_code, bank_name, account_holder_name
+        bank_details = data.get('bankDetails') 
 
         if not all([user_id, amount, bank_card_id, bank_details]):
             return jsonify({'success': False, 'message': 'Missing withdrawal details.'}), 400
 
-        # Amount validation
         if not isinstance(amount, (int, float)) or amount <= 0:
             return jsonify({'success': False, 'message': 'Invalid withdrawal amount.'}), 400
 
-        # 1. Fetch current balance and check
-        wallet_response = supabase.table('user_wallets').select('balance').eq('user_id', user_id).single().execute()
+        # 1. Fetch current order_income from the user's wallet
+        wallet_response = supabase.table('user_wallets').select('order_income').eq('user_id', user_id).single().execute()
         if not wallet_response.data:
             app_logger.warning(f"User wallet not found for withdrawal for user: {user_id}")
             return jsonify({'success': False, 'message': 'User wallet not found.'}), 404
 
-        current_balance = wallet_response.data['balance']
-        if current_balance < amount:
-            return jsonify({'success': False, 'message': 'Insufficient balance for withdrawal.'}), 400
+        current_order_income = wallet_response.data['order_income']
+        
+        # 2. Calculate Fee and Final Amount
+        fee_rate = 0.12
+        withdrawal_fee = round(amount * fee_rate, 2)
+        total_amount_to_deduct = round(amount, 2)
 
-        # 2. Deduct amount from wallet immediately
-        new_balance = current_balance - amount
-        wallet_update_response = supabase.table('user_wallets').update({'balance': new_balance}).eq('user_id', user_id).execute()
+        print(f"DEBUG: Current income in DB: {current_order_income}, Withdrawal requested: {total_amount_to_deduct}")
+        
+        # Check if withdrawal amount exceeds the order_income
+        if current_order_income < total_amount_to_deduct:
+            return jsonify({'success': False, 'message': 'Insufficient order income for withdrawal.'}), 400
+
+        # 3. Deduct amount from order_income immediately
+        new_order_income = current_order_income - total_amount_to_deduct
+        wallet_update_response = supabase.table('user_wallets').update({'order_income': new_order_income}).eq('user_id', user_id).execute()
 
         if not wallet_update_response.data or len(wallet_update_response.data) == 0:
             app_logger.error(f"Failed to update wallet balance for withdrawal for user {user_id}. Supabase response: {wallet_update_response.error if hasattr(wallet_update_response, 'error') else 'No data or error'}")
             return jsonify({'success': False, 'message': 'Failed to update wallet balance for withdrawal.'}), 500
 
-        app_logger.info(f"Wallet updated for {user_id}. New balance: {new_balance}. Recording withdrawal request.")
+        app_logger.info(f"Wallet updated for {user_id}. New order income: {new_order_income}. Recording withdrawal request.")
 
-        # 3. Record Transaction with 'pending' status
+        # 4. Record Transaction with 'pending' status
         transaction_data = {
             'user_id': user_id,
-            'amount': amount, # Store in INR for your records
+            'amount': total_amount_to_deduct,
+            'fee': withdrawal_fee,
             'type': 'withdrawal',
-            'status': 'pending', # Set to pending for manual processing
-            'description': f"Withdrawal request for {amount} INR (manual processing)",
-            'bank_card_id': bank_card_id, # <--- ENSURE THIS IS POPULATED HERE AND LINKED IN DB
-            'metadata': { # Still useful for redundant storage or extra info not covered by direct columns
-                'account_holder_name': bank_details['account_holder_name'],
-                'bank_name': bank_details['bank_name'],
-                'account_number': bank_details['account_number'], # Store full account number for manual transfer
-                'ifsc_code': bank_details['ifsc_code']
-            }
+            'status': 'pending',
+            'description': f"Withdrawal request for {total_amount_to_deduct} INR (manual processing)",
+            'bank_card_id': bank_card_id,
+            'metadata': bank_details
         }
         transaction_response = supabase.table('transactions').insert(transaction_data).execute()
 
         if not transaction_response.data or len(transaction_response.data) == 0:
             app_logger.error(f"Failed to record pending withdrawal transaction for user {user_id}. Supabase response: {transaction_response.error if hasattr(transaction_response, 'error') else 'No data or error'}")
-            # CRITICAL: If this happens, wallet was deducted but no transaction. Refund the wallet.
-            app_logger.error(f"Attempting to refund {amount} to user {user_id} due to transaction record failure.")
-            supabase.table('user_wallets').update({'balance': current_balance}).eq('user_id', user_id).execute() # Simplified refund
-            return jsonify({'success': False, 'message': 'Failed to record withdrawal request after wallet deduction. Amount refunded to wallet. Please try again or contact support.'}), 500
+            app_logger.error(f"Attempting to refund {total_amount_to_deduct} to user {user_id} due to transaction record failure.")
+            supabase.table('user_wallets').update({'order_income': current_order_income}).eq('user_id', user_id).execute()
+            return jsonify({'success': False, 'message': 'Failed to record withdrawal request. Amount refunded to wallet. Please try again or contact support.'}), 500
 
         app_logger.info(f"Withdrawal request recorded as pending for user {user_id}. Transaction ID: {transaction_response.data[0]['id']}")
 
         return jsonify({
             'success': True,
-            'message': f'Withdrawal request for ₹{amount} submitted. It is now pending manual processing.',
-            'new_balance': new_balance,
+            'message': f'Withdrawal request for ₹{total_amount_to_deduct} submitted. It is now pending manual processing.',
+            'new_order_income': new_order_income,
             'transaction_id': transaction_response.data[0]['id']
         }), 200
 
     except Exception as e:
         app_logger.error(f"Unhandled error in withdrawal request for user {user_id}: {e}", exc_info=True)
         return jsonify({'success': False, 'message': 'An unexpected error occurred during withdrawal request submission.'}), 500
-
+    
 
 # --- Main execution block ---
 if __name__ == '__main__':
